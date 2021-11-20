@@ -2,192 +2,248 @@ package balancer
 
 import (
 	"context"
+	// "context"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
+
+	// "exec"
+	"strconv"
+	"sync"
+	// "sync/atomic"
 	"time"
 )
 
-const (
-	Attempts int = iota
-	Retry
+
+
+type container struct{
+	id int
+	proxyPort string
+	alive bool
+	reverseProxy *httputil.ReverseProxy
+	mux sync.RWMutex
+}
+
+type backendPool struct{
+	backends []*container
+	current uint32
+}
+
+var (
+	backendpool backendPool
+	portsUsed []string
 )
 
-type Controller struct{
-	URL *url.URL
-	Alive bool
-	mux sync.RWMutex
-	ReverseProxy *httputil.ReverseProxy
-}
+const (
+	dockerFilePath = "../Docker/dockerfile"
+	localhostUrl = "http://127.0.0.1"
+	Retry int = 0
+	Attempts int = 0
+)
 
-type controllerPool struct {
-	controllers []*Controller
-	current uint64
-}
-
-func (s *controllerPool) NextIndex() int{
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.controllers)))
-}
-
-// GetNextPeer Returns next active controller to take a connection
-func (c *controllerPool) GetNextPeer() *Controller {
-	next := c.NextIndex()
-	l := len(c.controllers) + next
-	for i := next; i < l; i++{
-		idx := i % len(c.controllers)
-
-		if c.controllers[idx].IsAlive(){
-			if i != next{
-				atomic.StoreUint64(&c.current, uint64(idx))
-			}
-			return c.controllers[idx]
+func contains(s[] string, str string) bool {
+	for _, v := range s{
+		if v == str{
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
+func (bp *backendPool) NextIndex() int{
+	return int(atomic.AddUint32(&bp.current, uint32(1)) % uint32(len(bp.backends)))
+}
 
-func (c *Controller) SetAlive(alive bool){
+func (c *container) setAlive(alive bool){
 	c.mux.Lock()
-	c.Alive = alive
+	c.alive = alive
 	c.mux.Unlock()
 }
 
-func (c *Controller) IsAlive() (alive bool){
+func (c* container) isAlive() bool{
 	c.mux.RLock()
-	alive = c.Alive
-	c.mux.RUnlock()
-	return
+	defer c.mux.RUnlock()
+	return c.alive
 }
 
-func GetRetryFromContext(r *http.Request) int{
+func GetAttemptsFromContext(r *http.Request)int{
+	if attempts, ok := r.Context().Value(Attempts).(int); ok{
+		return attempts
+	}
+	return 0
+}
+
+func GetRetryFromContext(r *http.Request)int{
 	if retry, ok := r.Context().Value(Retry).(int); ok{
 		return retry
 	}
 	return 0
 }
 
-func GetAttemptsFromContext(r *http.Request) int {
-	if attempts, ok := r.Context().Value(Attempts).(int); ok{
-		return attempts
-	}
-	return 1
-}
-
-func (c *controllerPool) MarkControllerStatus(controllerUrl *url.URL, alive bool){
-	for _, controller := range c.controllers{
-		if controller.URL.String() == controllerUrl.String(){
-			controller.SetAlive(alive)
+func (bp *backendPool) markBackendStatus(port string, alive bool){
+	for _, backend := range bp.backends{
+		if backend.proxyPort == port{
+			backend.setAlive(alive)
 			break
 		}
 	}
 }
 
-// checks whether a controller is Alive by establishing a TCP connection
-func isControllerAlive(u *url.URL) bool{
-	timeout := 2 * time.Second
-	conn, err := net.DialTimeout("tcp", u.Host, timeout)
-	if err != nil {
-		log.Println("Site unreachable, error: ", err)
-		return false
+func (bp *backendPool) initializePool(proxyPorts string){
+	ports := strings.Split(proxyPorts, ";")
+	if len(ports) == 0{
+		log.Println("Don't find port from config parametrs")
+		return
 	}
-	_ = conn.Close()
-	return true
-}
-
-func (c *controllerPool) AddBackend(controller *Controller){
-	c.controllers = append(c.controllers, controller)
-}
-
-// HealthCheck pings the controllers and update the status
-func (s *controllerPool) HealthCheck(){
-	for _, c := range s.controllers {
-		status := "up"
-		alive := isControllerAlive(c.URL)
-		c.SetAlive(alive)
-		if !alive {
-			status = "down"
+	for uid, port := range ports{
+		log.Printf("container[%d] with port[%s] was added", uid, port)
+		urlServer, err := url.Parse(localhostUrl + port)
+		if err != nil {
+			log.Printf("Can't parse this url: %s", urlServer)
+			return
 		}
-		log.Printf("%s [%s]\n", c.URL, status)
+		proxy := httputil.NewSingleHostReverseProxy(urlServer)
+		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, err error) {
+				log.Printf("[%s] %s\n", urlServer, err.Error())
+				retries := GetRetryFromContext(request)
+				if retries > 3 {
+					select {
+					case <-time.After(10 * time.Millisecond):
+						ctx := context.WithValue(request.Context(), Retry, retries+1)
+						proxy.ServeHTTP(writer, request.WithContext(ctx))
+					}
+					return
+				}
+				backendpool.markBackendStatus(port, false)
+
+				attempts := GetAttemptsFromContext(request)
+				log.Printf("%s (%s) Attemping retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
+				ctx := context.WithValue(request.Context(), attempts, attempts+1)
+				proxyToAlive(writer, request.WithContext(ctx))
+		}
+		bp.addContainer(&container{
+			id: uid,
+			proxyPort: port,
+			alive: false,
+			reverseProxy: proxy,
+		})
+		ports = append(ports, port)
 	}
+	return
 }
 
-func healthCheck() {
-	t := time.NewTicker(time.Second * 20)
-	for {
-		select {
-		case <-t.C:
-		log.Println("Starting  health check...")
-		ControlPOOL.HealthCheck()
-		log.Println("Health check completed")
+func generatePort() string{
+	rand.Seed(time.Now().UnixNano())
+	min:=9000
+	max:=1000
+	port := strconv.Itoa(rand.Intn(max)+min)
+	log.Printf("Random port [%s]", port)
+	found := contains(portsUsed, port)
+	if !found{
+		return port
+	}
+	return ""
+}
+
+func (bp *backendPool) addContainer(c *container){
+	bp.backends = append(bp.backends, c)
+}
+
+
+func (bp *backendPool) backendMapping()  *container{
+	next := bp.NextIndex()
+	l := len(bp.backends) + next
+	for i:=next; i < l; i++{
+		idx := i % len(bp.backends)
+		if bp.backends[idx].isAlive(){
+			if i != next{
+				atomic.StoreUint32(&bp.current, uint32(idx))
+			}
+			return bp.backends[idx]
 		}
 	}
+	return nil
 }
 
-func controllerBalancer(w http.ResponseWriter, r *http.Request){
+
+func proxyToAlive(w http.ResponseWriter, r *http.Request){
+	backend := backendpool.backendMapping()
 	attempts := GetAttemptsFromContext(r)
-	if attempts > 3{
+	if attempts > 3 {
 		log.Printf("%s(%s) Max attempts reached terminating\n", r.RemoteAddr, r.URL.Path)
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 		return
 	}
-	peer := ControlPOOL.GetNextPeer()
-	if peer != nil{
-		peer.ReverseProxy.ServeHTTP(w, r)
+	urlServer, err := url.Parse(localhostUrl + backend.proxyPort)
+	if err != nil {
+		log.Printf("Can't parse this url: %s", urlServer)
 		return
 	}
+	log.Printf("Redirect to: %s", urlServer)
+	if backend != nil{
+		backend.reverseProxy.ServeHTTP(w, r)
+		return
+	}
+
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
-var ControlPOOL controllerPool
-
-func startControllerBalancer(){
-	controllerList := "http://127.0.0.1:8080,http://127.0.0.1:8081,"
-
-	tokens := strings.Split(controllerList, ",")
-	for _, tok := range tokens {
-		controllerUrl, err := url.Parse(tok)
-		if err != nil{
-			log.Fatal(err)
-		}
-		proxy := httputil.NewSingleHostReverseProxy(controllerUrl)
-		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
-			log.Printf("[%s] %s\n", controllerUrl.Host, e.Error())
-			retries := GetRetryFromContext(request)
-			if retries < 3 {
-				select {
-				case <-time.After(10 * time.Millisecond):
-					ctx := context.WithValue(request.Context(), Retry, retries+1)
-					proxy.ServeHTTP(writer, request.WithContext(ctx))
-				}
-				return
-			}
-			ControlPOOL.MarkControllerStatus(controllerUrl, false)
-
-
-			attempts := GetAttemptsFromContext(request)
-			log.Printf("%s (%s) Attemping retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
-			ctx := context.WithValue(request.Context(), attempts, attempts+1)
-			controllerBalancer(writer, request.WithContext(ctx))
-		}
-		ControlPOOL.AddBackend(&Controller{
-			URL: controllerUrl,
-			Alive: true,
-			ReverseProxy: proxy,
-		})
+func isBackendAlive(u *url.URL) bool{
+	timeout := 4 * time.Second
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	defer conn.Close()
+	if err!=nil{
+		log.Printf("Service unreachable url: %s with err: %s", u.Host, err)
+		return false
 	}
-	server := http.Server{
-		Addr: ":3222",
-		Handler: http.HandlerFunc(controllerBalancer),
-	}
-	go healthCheck()
-	if err:= server.ListenAndServe(); err != nil{
-		log.Fatal(err)
+	return true
+}
+
+func (bp *backendPool) healthCheck(){
+	for _, b := range bp.backends{
+		status := "ready"
+		backendUrl, err := url.Parse(localhostUrl + b.proxyPort)
+		if err != nil {
+			log.Printf("Error when parsing url: %s%s", localhostUrl, b.proxyPort)
+			return
+		}
+		alive := isBackendAlive(backendUrl)
+		b.setAlive(alive)
+		if !alive {
+			status = "down"
+		}
+		log.Printf("%s [%s]\n", backendUrl, status)
 	}
 }
 
+func healthCheck(){
+	tiker := time.NewTicker(time.Second * 5)
+	for {
+		select {
+		case <-tiker.C:
+			log.Println("Start heath check...")
+			backendpool.healthCheck()
+			log.Println("Stop health check...")
+		}
+	}
+}
+
+
+func RunBalancer(){
+	proxyPorts := ":8081;:8082"
+
+	backendpool.initializePool(proxyPorts)
+	go healthCheck()
+
+	server := http.Server{
+		Addr: ":3222",
+		Handler: http.HandlerFunc(proxyToAlive),
+	}
+
+	server.ListenAndServe()
+}
