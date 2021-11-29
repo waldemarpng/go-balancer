@@ -1,8 +1,8 @@
 package balancer
 
 import (
+	"backend"
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -17,16 +17,8 @@ import (
 )
 
 
-type backend struct{
-	proxyPort string
-	alive bool
-	reverseProxy *httputil.ReverseProxy
-	mux sync.RWMutex
-	downUnixTime int64
-}
-
 type backendPool struct{
-	backends []*backend
+	backends []* backend.ServerNode
 	current uint32
 }
 
@@ -36,11 +28,9 @@ var (
 )
 
 const (
-	dockerFilePath = "../Docker/dockerfile"
 	localhostUrl = "http://127.0.0.1"
 	Retry int = 0
 	Attempts int = 0
-	minBackends int = 3
 )
 
 func contains(s[] string, str string) bool {
@@ -54,21 +44,6 @@ func contains(s[] string, str string) bool {
 
 func (bp *backendPool) NextIndex() int{
 	return int(atomic.AddUint32(&bp.current, uint32(1)) % uint32(len(bp.backends)))
-}
-
-func (c *backend) setAlive(alive bool){
-	c.mux.Lock()
-	c.alive = alive
-	if !alive && c.downUnixTime == 0{
-		c.downUnixTime = time.Now().Unix()
-	}
-	c.mux.Unlock()
-}
-
-func (c*backend) isAlive() bool{
-	c.mux.RLock()
-	defer c.mux.RUnlock()
-	return c.alive
 }
 
 func GetAttemptsFromContext(r *http.Request)int{
@@ -86,9 +61,9 @@ func GetRetryFromContext(r *http.Request)int{
 }
 
 func (bp *backendPool) markBackendStatus(port string, alive bool){
-	for _, backend := range bp.backends{
-		if backend.proxyPort == port{
-			backend.setAlive(alive)
+	for _, serverNode := range bp.backends{
+		if serverNode.ProxyPort == port{
+			serverNode.SetAlive(alive)
 			break
 		}
 	}
@@ -96,15 +71,15 @@ func (bp *backendPool) markBackendStatus(port string, alive bool){
 
 func (bp *backendPool) getAliveCount() (count int){
 	count = 0
-	for _, backend := range bp.backends{
-		if backend.isAlive(){
+	for _, serverNode := range bp.backends{
+		if serverNode.IsAlive(){
 			count +=1
 		}
 	}
 	return
 }
 
-func initializeBackend(port string){
+func initializeServerNode(port string, fromConfig bool){
 	log.Printf("backend with port[%s] was added", port)
 	urlServer, err := url.Parse(localhostUrl + port)
 	if err != nil {
@@ -130,11 +105,21 @@ func initializeBackend(port string){
 		ctx := context.WithValue(request.Context(), attempts, attempts+1)
 		proxyToAlive(writer, request.WithContext(ctx))
 	}
-	backendpool.addContainer(&backend{
-		proxyPort: port,
-		alive: true,
-		reverseProxy: proxy,
-	})
+	backendNode := &backend.ServerNode{
+		ProxyPort: port,
+		Alive: true,
+		ReverseProxy: proxy,
+	}
+	if !fromConfig {
+		/*
+			Если передается значение из конфига, то мы не запускаем сервер в горутине
+		*/
+		backendServer := backendNode.CreateServer()
+		go func() {
+			backendServer.ListenAndServe()
+		}()
+	}
+	backendpool.addContainer(backendNode)
 	appendPort(port)
 }
 
@@ -153,52 +138,12 @@ func getPorts() []string{
 	return ports
 }
 
-// TODO: Поменять проверку удаления
-func updateBackends(backends []*backend){
-	mux := sync.RWMutex{}
-	mux.RLock()
-	backendpool.backends = backends
-	mux.RUnlock()
 
-}
-
-// TODO: Поменять проверку удаления
 func updatePorts(ports []string){
 	mux := sync.RWMutex{}
 	mux.RLock()
 	portsUsed = ports
 	mux.RUnlock()
-
-}
-
-// TODO: Поменять проверку удаления
-func deletePort(port string){
-	ports:=getPorts()
-	for idx, value := range ports{
-		if value == port{
-			lenPorts := len(ports)
-			ports[idx] = ports[lenPorts - 1]
-			ports[lenPorts-1] = " "
-			ports = ports[:lenPorts -1 ]
-			updatePorts(ports)
-			return
-		}
-	}
-}
-
-// TODO: Поменять проверку удаления
-func deleteBackend(port string){
-	backends := backendpool.backends
-	for idx, value := range backends{
-		if value.proxyPort == port{
-			lenBackends := len(backends)
-			backends[idx] = backends[lenBackends - 1]
-			backends[lenBackends-1] = nil
-			backends = backends[:lenBackends -1 ]
-			updateBackends(backends)
-			return
-		}
-	}
 }
 
 func (bp *backendPool) initializePool(proxyPorts string){
@@ -208,7 +153,7 @@ func (bp *backendPool) initializePool(proxyPorts string){
 		return
 	}
 	for _, port := range ports{
-		initializeBackend(port)
+		initializeServerNode(port, true)
 	}
 	return
 }
@@ -226,17 +171,17 @@ func generatePort() string{
 	return ""
 }
 
-func (bp *backendPool) addContainer(c *backend){
+func (bp *backendPool) addContainer(c *backend.ServerNode){
 	bp.backends = append(bp.backends, c)
 }
 
 
-func (bp *backendPool) backendMapping()  *backend {
+func (bp *backendPool) backendMapping()  *backend.ServerNode {
 	next := bp.NextIndex()
 	l := len(bp.backends) + next
 	for i:=next; i < l; i++{
 		idx := i % len(bp.backends)
-		if bp.backends[idx].isAlive(){
+		if bp.backends[idx].IsAlive(){
 			if i != next{
 				atomic.StoreUint32(&bp.current, uint32(idx))
 			}
@@ -255,14 +200,14 @@ func proxyToAlive(w http.ResponseWriter, r *http.Request){
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 		return
 	}
-	urlServer, err := url.Parse(localhostUrl + backend.proxyPort)
+	urlServer, err := url.Parse(localhostUrl + backend.ProxyPort)
 	if err != nil {
 		log.Printf("Can't parse this url: %s", urlServer)
 		return
 	}
 	log.Printf("Redirect to: %s", urlServer)
 	if backend != nil{
-		backend.reverseProxy.ServeHTTP(w, r)
+		backend.ReverseProxy.ServeHTTP(w, r)
 		return
 	}
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
@@ -286,23 +231,23 @@ func isBackendAlive(u *url.URL) bool{
 func (bp *backendPool) healthCheck(){
 	for _, b := range bp.backends{
 		status := "ready"
-		backendUrl, err := url.Parse(localhostUrl + b.proxyPort)
+		backendUrl, err := url.Parse(localhostUrl + b.ProxyPort)
 		if err != nil {
-			log.Printf("Error when parsing url: %s%s", localhostUrl, b.proxyPort)
+			log.Printf("Error when parsing url: %s%s", localhostUrl, b.ProxyPort)
 			return
 		}
 		alive := isBackendAlive(backendUrl)
-		b.setAlive(alive)
+		b.SetAlive(alive)
 		if !alive {
 			status = "down"
-			log.Printf("Backend down in: %s\n", time.Unix(b.downUnixTime, 0))
+			log.Printf("Backend down in: %s\n", time.Unix(b.DownUnixTime, 0))
 		}
 		log.Printf("%s [%s]\n", backendUrl, status)
 
 	}
 }
 
-func healthCheck(portChannel chan string){
+func healthCheck(){
 	ticker := time.NewTicker(time.Second * 5)
 	for {
 		select {
@@ -312,8 +257,7 @@ func healthCheck(portChannel chan string){
 			aliveCount := backendpool.getAliveCount()
 			if aliveCount < 2{
 				port := generatePort()
-				go initializeBackend(port)
-				portChannel <-port
+				initializeServerNode(port, false)
 			}
 			backendpool.checkInactiveBackends()
 			log.Println(portsUsed)
@@ -326,27 +270,48 @@ func healthCheck(portChannel chan string){
 }
 
 
-func runBackend(backendPorts chan string){
-	for{
-		select {
-		case port := <-backendPorts:
-			log.Printf("Try to init backend with port: %s", port)
-			http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-					fmt.Fprintf(writer, port)
-			})
-			log.Fatal(http.ListenAndServe("localhost"+port, nil))
+func (bp *backendPool) checkInactiveBackends(){
+	for _, b := range bp.backends {
+		nowUnixTime := time.Now().Unix()
+		if nowUnixTime - b.DownUnixTime > 5 && !b.Alive{
+			port := b.ProxyPort
+			bp.deleteInactive(port)
+			deletePort(port)
 		}
 	}
 }
 
-func (bp *backendPool) checkInactiveBackends(){
-	for _, b := range bp.backends {
-		nowUnixTime := time.Now().Unix()
-		if nowUnixTime - b.downUnixTime > 5 && !b.alive{
-			// TODO: Поменять проверку удаления
-			port := b.proxyPort
-			deleteBackend(port)
-			deletePort(port)
+
+func updateBackends(backends []*backend.ServerNode){
+	mux := sync.RWMutex{}
+	mux.RLock()
+	backendpool.backends = backends
+	mux.RUnlock()
+
+}
+
+func deletePort(port string){
+	portsSlice := getPorts()
+	for idx, value := range portsSlice{
+		if value == port{
+			portsLen := len(portsSlice)
+			portsSlice[idx] = portsSlice[portsLen - 1]
+			portsSlice = portsSlice[:portsLen - 1]
+			updatePorts(portsSlice)
+			return
+		}
+	}
+}
+
+func (bp *backendPool) deleteInactive(port string){
+	serverNodeSlice := bp.backends
+	for idx, value := range serverNodeSlice{
+		if value.ProxyPort == port{
+			serverNodeLen := len(serverNodeSlice)
+			serverNodeSlice[idx] = serverNodeSlice[serverNodeLen - 1]
+			serverNodeSlice = serverNodeSlice[:serverNodeLen - 1]
+			updateBackends(serverNodeSlice)
+			return
 		}
 	}
 }
@@ -354,14 +319,11 @@ func (bp *backendPool) checkInactiveBackends(){
 
 func RunBalancer(){
 	proxyPorts := ":8081"
-	portChannel := make(chan string, 2)
 	backendpool.initializePool(proxyPorts)
-	go healthCheck(portChannel)
-	go runBackend(portChannel)
+	go healthCheck()
 	server := http.Server{
 		Addr: ":3222",
 		Handler: http.HandlerFunc(proxyToAlive),
 	}
 	server.ListenAndServe()
-
 }
