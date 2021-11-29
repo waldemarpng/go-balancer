@@ -22,6 +22,7 @@ type backend struct{
 	alive bool
 	reverseProxy *httputil.ReverseProxy
 	mux sync.RWMutex
+	downUnixTime int64
 }
 
 type backendPool struct{
@@ -39,6 +40,7 @@ const (
 	localhostUrl = "http://127.0.0.1"
 	Retry int = 0
 	Attempts int = 0
+	minBackends int = 3
 )
 
 func contains(s[] string, str string) bool {
@@ -57,6 +59,9 @@ func (bp *backendPool) NextIndex() int{
 func (c *backend) setAlive(alive bool){
 	c.mux.Lock()
 	c.alive = alive
+	if !alive && c.downUnixTime == 0{
+		c.downUnixTime = time.Now().Unix()
+	}
 	c.mux.Unlock()
 }
 
@@ -127,10 +132,73 @@ func initializeBackend(port string){
 	}
 	backendpool.addContainer(&backend{
 		proxyPort: port,
-		alive: false,
+		alive: true,
 		reverseProxy: proxy,
 	})
+	appendPort(port)
+}
+
+func appendPort(port string){
+	mux := sync.RWMutex{}
+	mux.RLock()
 	portsUsed = append(portsUsed, port)
+	mux.RUnlock()
+}
+
+func getPorts() []string{
+	mux := sync.RWMutex{}
+	mux.Lock()
+	ports :=portsUsed
+	mux.Unlock()
+	return ports
+}
+
+// TODO: Поменять проверку удаления
+func updateBackends(backends []*backend){
+	mux := sync.RWMutex{}
+	mux.RLock()
+	backendpool.backends = backends
+	mux.RUnlock()
+
+}
+
+// TODO: Поменять проверку удаления
+func updatePorts(ports []string){
+	mux := sync.RWMutex{}
+	mux.RLock()
+	portsUsed = ports
+	mux.RUnlock()
+
+}
+
+// TODO: Поменять проверку удаления
+func deletePort(port string){
+	ports:=getPorts()
+	for idx, value := range ports{
+		if value == port{
+			lenPorts := len(ports)
+			ports[idx] = ports[lenPorts - 1]
+			ports[lenPorts-1] = " "
+			ports = ports[:lenPorts -1 ]
+			updatePorts(ports)
+			return
+		}
+	}
+}
+
+// TODO: Поменять проверку удаления
+func deleteBackend(port string){
+	backends := backendpool.backends
+	for idx, value := range backends{
+		if value.proxyPort == port{
+			lenBackends := len(backends)
+			backends[idx] = backends[lenBackends - 1]
+			backends[lenBackends-1] = nil
+			backends = backends[:lenBackends -1 ]
+			updateBackends(backends)
+			return
+		}
+	}
 }
 
 func (bp *backendPool) initializePool(proxyPorts string){
@@ -151,7 +219,7 @@ func generatePort() string{
 	max:=1000
 	port := ":"+strconv.Itoa(rand.Intn(max)+min)
 	log.Printf("Random port [%s]", port)
-	found := contains(portsUsed, port)
+	found := contains(getPorts(), port)
 	if !found{
 		return port
 	}
@@ -227,8 +295,10 @@ func (bp *backendPool) healthCheck(){
 		b.setAlive(alive)
 		if !alive {
 			status = "down"
+			log.Printf("Backend down in: %s\n", time.Unix(b.downUnixTime, 0))
 		}
 		log.Printf("%s [%s]\n", backendUrl, status)
+
 	}
 }
 
@@ -240,11 +310,14 @@ func healthCheck(portChannel chan string){
 			log.Println("Start heath check...")
 			backendpool.healthCheck()
 			aliveCount := backendpool.getAliveCount()
-			if aliveCount == 0{
+			if aliveCount < 2{
 				port := generatePort()
 				go initializeBackend(port)
 				portChannel <-port
 			}
+			backendpool.checkInactiveBackends()
+			log.Println(portsUsed)
+
 			log.Printf("Ready to accept connection: %d", aliveCount)
 			log.Println("Stop health check...")
 		}
@@ -252,10 +325,12 @@ func healthCheck(portChannel chan string){
 	}
 }
 
+
 func runBackend(backendPorts chan string){
 	for{
 		select {
 		case port := <-backendPorts:
+			log.Printf("Try to init backend with port: %s", port)
 			http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 					fmt.Fprintf(writer, port)
 			})
@@ -264,21 +339,29 @@ func runBackend(backendPorts chan string){
 	}
 }
 
+func (bp *backendPool) checkInactiveBackends(){
+	for _, b := range bp.backends {
+		nowUnixTime := time.Now().Unix()
+		if nowUnixTime - b.downUnixTime > 5 && !b.alive{
+			// TODO: Поменять проверку удаления
+			port := b.proxyPort
+			deleteBackend(port)
+			deletePort(port)
+		}
+	}
+}
 
 
 func RunBalancer(){
-	proxyPorts := ":8081;:8082"
+	proxyPorts := ":8081"
 	portChannel := make(chan string, 2)
 	backendpool.initializePool(proxyPorts)
 	go healthCheck(portChannel)
 	go runBackend(portChannel)
-
-
 	server := http.Server{
 		Addr: ":3222",
 		Handler: http.HandlerFunc(proxyToAlive),
 	}
-
 	server.ListenAndServe()
 
 }
